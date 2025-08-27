@@ -23,11 +23,14 @@ config RGBLED_WIDGET_WS2812
 
 if RGBLED_WIDGET_WS2812
 
-config LED_STRIP
-    default y
+config RGBLED_WIDGET_LED_STRIP_PWM
+    bool "Enable PWM instead of SPI"
+    default n
+# config LED_STRIP
+#     default y
     
-config WS2812_STRIP
-    default y
+# config WS2812_STRIP
+#     default y
 
 config RGBLED_WIDGET_LED_COUNT
     int "Number of LEDs in the strip"
