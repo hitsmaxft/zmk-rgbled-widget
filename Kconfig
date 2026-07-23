@@ -231,7 +231,7 @@ config RGBLED_WIDGET_CONN_COLOR_USB
     default $(COLOR_CYAN)
 
 menu "RGB LED Widget Connectivity Options"
-    depends on CONFIG_RGBLED_WIDGET_WS2812
+    depends on RGBLED_WIDGET_WS2812
 
 config RGBLED_WIDGET_CONN_COLOR_BT0
     int "Color index for BLE Profile 0"

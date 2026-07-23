@@ -346,7 +346,7 @@ static enum status_priority get_priority_for_status(enum status_type status_type
 
 static int set_status_led(enum status_type status_type, uint8_t color_idx, 
                          uint16_t duration_ms, bool persistent) {
-    LOG_WRN(">>> TRAP 1: status=%d, color=%d, timeout=%d, persist=%d", status_type, color_idx, duration_ms, persistent);
+    LOG_DBG("set_status_led: status=%d, color=%d, timeout=%d, persist=%d", status_type, color_idx, duration_ms, persistent);
     uint8_t primary_led = get_primary_led_for_status(status_type);
     uint8_t priority = get_priority_for_status(status_type, color_idx);
     
@@ -396,11 +396,14 @@ int ws2812_clear_status_led(enum status_type status_type) {
 // Pattern Engine Functions
 #if IS_ENABLED(CONFIG_RGBLED_WIDGET_ANIMATIONS)
 
-static void rgb_interpolate(struct led_rgb *start, struct led_rgb *end, 
+static void rgb_interpolate(struct led_rgb *start, struct led_rgb *end,
                            float factor, struct led_rgb *result) {
-    result->r = (uint8_t)(start->r + (end->r - start->r) * factor);
-    result->g = (uint8_t)(start->g + (end->g - start->g) * factor);
-    result->b = (uint8_t)(start->b + (end->b - start->b) * factor);
+    int16_t dr = (int16_t)end->r - (int16_t)start->r;
+    int16_t dg = (int16_t)end->g - (int16_t)start->g;
+    int16_t db = (int16_t)end->b - (int16_t)start->b;
+    result->r = (uint8_t)CLAMP((int16_t)start->r + (int16_t)(dr * factor), 0, 255);
+    result->g = (uint8_t)CLAMP((int16_t)start->g + (int16_t)(dg * factor), 0, 255);
+    result->b = (uint8_t)CLAMP((int16_t)start->b + (int16_t)(db * factor), 0, 255);
 }
 
 static void apply_brightness(struct led_rgb *color, uint8_t brightness) {
@@ -453,21 +456,15 @@ static void update_led_animation(uint8_t led_index) {
     if (led_index >= CONFIG_RGBLED_WIDGET_LED_COUNT) {
         return;
     }
-    
+
     struct led_state *state = &led_states[led_index];
     struct animation_state *anim = &state->anim;
-    
+
     if (anim->type == ANIM_STATIC) {
-        return; // Nothing to animate
-    }
-    
-    uint32_t current_time = k_uptime_get_32();
-    static uint32_t last_update = 0;
-    
-    if (last_update == 0) {
-        last_update = current_time;
         return;
     }
+
+    uint32_t current_time = k_uptime_get_32();
     
     switch (anim->type) {
     case ANIM_BLINK:
@@ -517,11 +514,8 @@ static void update_led_animation(uint8_t led_index) {
         break;
         
     default:
-        // Unsupported animation types
         break;
     }
-    
-    last_update = current_time;
 }
 
 static void update_all_animations(void) {
@@ -904,27 +898,19 @@ static bool can_share_led(uint8_t led_index, uint8_t new_priority) {
     if (led_index >= CONFIG_RGBLED_WIDGET_LED_COUNT) {
         return false;
     }
-    
+
     struct led_state *state = &led_states[led_index];
-    
-    // Critical battery status can never be overridden
-    if (state->priority == PRIORITY_CRITICAL_BATTERY) {
-        return false;
-    }
-    
 
-    // FIXME can not update same status since their priority is equals
-
-    // Higher priority can override lower priority
+    // Higher or equal priority can always override (lower numeric value = higher priority)
     if (new_priority <= state->priority) {
         return true;
     }
-    
-    // Same priority can share if LED is marked as shareable
-    if (new_priority == state->priority && state->is_shared) {
+
+    // Lower priority can share if LED is marked as shareable
+    if (state->is_shared) {
         return true;
     }
-    
+
     return false;
 }
 
@@ -996,7 +982,7 @@ static void check_shared_led_timeouts(void) {
         
         if (state->is_shared && state->share_end_time > 0 && 
             current_time >= state->share_end_time) {
-            LOG_WRN(">>> TRAP 3: Timeout Triggered for LED %d! Returning to base_color.", i);
+            LOG_DBG("Shared LED %d timeout, returning to base_color", i);
             return_shared_led(i);
         }
     }
@@ -1232,14 +1218,14 @@ static int led_battery_listener_cb(const zmk_event_t *eh) {
     bool is_usb_event = (as_zmk_usb_conn_state_changed(eh) != NULL);
     struct zmk_battery_state_changed *bat_ev = as_zmk_battery_state_changed(eh);
     bool is_charging = zmk_usb_is_powered();
-    // ==================== 新增：EMA 低通滤波平滑监听 ====================
+    // EMA low-pass filter for battery level smoothing on peripherals
     #if IS_ENABLED(CONFIG_ZMK_SPLIT) && !IS_ENABLED(CONFIG_ZMK_SPLIT_ROLE_CENTRAL)
-        static float smoothed_battery = -1.0f;       
-        static uint8_t last_notified_level = 0;      
-        
+        static float smoothed_battery = -1.0f;
+        static uint8_t last_notified_level = 0;
+
         if (bat_ev != NULL) {
             uint8_t current_level = bat_ev->state_of_charge;
-            
+
             if (!is_charging) {
                 if (smoothed_battery < 0.0f) {
                     smoothed_battery = (float)current_level;
@@ -1247,23 +1233,20 @@ static int led_battery_listener_cb(const zmk_event_t *eh) {
                 } else {
                     smoothed_battery = (smoothed_battery * 0.9f) + ((float)current_level * 0.1f);
                 }
-                
+
                 uint8_t display_level = (uint8_t)(smoothed_battery + 0.5f);
-                
+
                 if (display_level == last_notified_level) {
-                    return 0; 
+                    return 0;
                 }
-                
+
                 last_notified_level = display_level;
-                bat_ev->state_of_charge = display_level; 
             } else {
-                // 【充电状态】：允许数据随充电上涨，并同步内部 EMA 记忆
                 smoothed_battery = (float)current_level;
                 last_notified_level = current_level;
             }
         }
     #endif
-    // ===================================================================
 
 
     if (is_usb_event || is_charging) {
@@ -1390,8 +1373,16 @@ static int led_layer_color_listener_cb(const zmk_event_t *eh) {
         case ZMK_ACTIVITY_SLEEP:
             LOG_INF("Detected sleep activity state, turn off LED");
             set_rgb_leds(0, 0);
+#if IS_ENABLED(CONFIG_RGBLED_WIDGET_WS2812)
+            if (ext_power_dev && ext_power_is_on) {
+                k_work_cancel_delayable(&ext_power_off_work);
+                ext_power_disable(ext_power_dev);
+                ext_power_is_on = false;
+                LOG_INF("ext_power OFF (deep sleep)");
+            }
+#endif
             break;
-        default: // not handling IDLE and ACTIVE yet
+        default:
             break;
         }
         return 0;
@@ -1515,7 +1506,7 @@ extern void led_process_thread(void *d0, void *d1, void *d2) {
 #endif
 
         if (result_code == 0) {
-            LOG_WRN(">>> TRAP 2: MSGQ Received! color=%d, duration=%d, sleep=%d", 
+            LOG_DBG("MSGQ received: color=%d, duration=%d, sleep=%d",
                 blink.color, blink.duration_ms, blink.sleep_ms);
             if (blink.duration_ms > 0) {
                 LOG_DBG("Got a blink item from msgq, color %d, duration %d", blink.color, blink.duration_ms);
@@ -1547,7 +1538,7 @@ extern void led_process_thread(void *d0, void *d1, void *d2) {
 
 // define led_process_thread with stack size 1024, start running it 100 ms after
 // boot
-K_THREAD_DEFINE(led_process_tid, 1024, led_process_thread, NULL, NULL, NULL,
+K_THREAD_DEFINE(led_process_tid, 1536, led_process_thread, NULL, NULL, NULL,
                 K_LOWEST_APPLICATION_THREAD_PRIO, 0, 100);
 
 extern void led_init_thread(void *d0, void *d1, void *d2) {
