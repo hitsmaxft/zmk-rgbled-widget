@@ -64,7 +64,6 @@ static int set_led_with_sharing(uint8_t led_index, uint8_t color_idx, uint8_t pr
                                bool persistent, uint32_t share_timeout_ms);
 static void return_shared_led(uint8_t led_index);
 static int set_led_pattern(uint8_t led_index, struct animation_state *pattern);
-static void apply_brightness(struct led_rgb *color, uint8_t brightness);
 static void rgb_interpolate(struct led_rgb *start, struct led_rgb *end,
                             uint8_t factor, struct led_rgb *result);
 static void update_led_animation(uint8_t led_index);
@@ -106,6 +105,7 @@ struct led_state {
     bool is_shared;               // Whether LED is currently shared
     bool is_persistent;           // Whether status should persist
     uint32_t share_end_time;      // When to return to base status
+    uint32_t animation_start_time; // Uptime when the current animation was triggered
     struct animation_state anim;  // Current animation state
 };
 #endif
@@ -179,6 +179,26 @@ struct blink_item {
 
 // flag to indicate whether the initial boot up sequence is complete
 static bool initialized = false;
+
+#if IS_ENABLED(CONFIG_ZMK_BATTERY_REPORTING) && IS_ENABLED(CONFIG_RGBLED_WIDGET_WS2812)
+// A zero reading means "not available" in the widget protocol. Preserve the last
+// valid local sample so an early/stale reading does not masquerade as a missing battery.
+static uint8_t last_valid_battery_level;
+
+static uint8_t get_local_battery_level(void) {
+    uint8_t battery_level = zmk_battery_state_of_charge();
+
+    if (battery_level > 0) {
+        last_valid_battery_level = battery_level;
+    } else if (last_valid_battery_level > 0) {
+        LOG_DBG("Using cached battery level %d%% for transient 0%% reading",
+                last_valid_battery_level);
+        battery_level = last_valid_battery_level;
+    }
+
+    return battery_level;
+}
+#endif
 
 // track current color for persistent indicators (layer color)
 uint8_t led_current_color = 0;
@@ -410,12 +430,6 @@ static void rgb_interpolate(struct led_rgb *start, struct led_rgb *end,
     result->b = start->b + (((int16_t)end->b - start->b) * factor) / 255;
 }
 
-static void apply_brightness(struct led_rgb *color, uint8_t brightness) {
-    color->r = (uint8_t)((color->r * brightness) / 255);
-    color->g = (uint8_t)((color->g * brightness) / 255);
-    color->b = (uint8_t)((color->b * brightness) / 255);
-}
-
 static int set_led_pattern(uint8_t led_index, struct animation_state *pattern) {
     if (led_index >= CONFIG_RGBLED_WIDGET_LED_COUNT || !pattern) {
         return -EINVAL;
@@ -423,6 +437,7 @@ static int set_led_pattern(uint8_t led_index, struct animation_state *pattern) {
 
     k_mutex_lock(&ws2812_mutex, K_FOREVER);
     led_states[led_index].anim = *pattern;
+    led_states[led_index].animation_start_time = k_uptime_get_32();
 
     // Apply initial state based on pattern type
     switch (pattern->type) {
@@ -434,12 +449,8 @@ static int set_led_pattern(uint8_t led_index, struct animation_state *pattern) {
 
     case ANIM_PULSE:
     case ANIM_FADE:
-        {
-            struct led_rgb start_rgb;
-            color_index_to_rgb(pattern->start_color, &start_rgb);
-            apply_brightness(&start_rgb, CONFIG_RGBLED_WIDGET_BRIGHTNESS / 4);
-            led_colors[led_index] = start_rgb;
-        }
+        color_index_to_rgb(pattern->start_color, &led_colors[led_index]);
+        led_states[led_index].current_color = pattern->start_color;
         break;
 
     case ANIM_WAVE:
@@ -468,7 +479,7 @@ static void update_led_animation(uint8_t led_index) {
         return; // Nothing to animate
     }
     
-    uint32_t current_time = k_uptime_get_32();
+    uint32_t elapsed = k_uptime_get_32() - state->animation_start_time;
 
     if (anim->period_ms == 0) {
         anim->type = ANIM_STATIC;
@@ -478,7 +489,7 @@ static void update_led_animation(uint8_t led_index) {
     switch (anim->type) {
     case ANIM_BLINK:
         {
-            uint32_t cycle_time = current_time % anim->period_ms;
+            uint32_t cycle_time = elapsed % anim->period_ms;
             uint8_t color = (cycle_time < anim->period_ms / 2) ? 
                            anim->start_color : anim->end_color;
             color_index_to_rgb(color, &led_colors[led_index]);
@@ -488,9 +499,9 @@ static void update_led_animation(uint8_t led_index) {
         
     case ANIM_PULSE:
         {
-            uint32_t cycle_time = current_time % anim->period_ms;
+            uint32_t cycle_time = elapsed % anim->period_ms;
             uint32_t triangle = ((uint64_t)cycle_time * 510U) / anim->period_ms;
-            uint8_t intensity = triangle <= 255U ? triangle : 510U - triangle;
+            uint8_t intensity = triangle <= 255U ? 255U - triangle : triangle - 255U;
             
             struct led_rgb start_rgb;
             struct led_rgb result_rgb = {0};
@@ -506,7 +517,7 @@ static void update_led_animation(uint8_t led_index) {
         
     case ANIM_FADE:
         {
-            uint32_t cycle_time = current_time % anim->period_ms;
+            uint32_t cycle_time = elapsed % anim->period_ms;
             uint8_t factor = ((uint64_t)cycle_time * 255U) / anim->period_ms;
             
             struct led_rgb start_rgb, end_rgb;
@@ -515,8 +526,6 @@ static void update_led_animation(uint8_t led_index) {
             color_index_to_rgb(anim->end_color, &end_rgb);
             
             rgb_interpolate(&start_rgb, &end_rgb, factor, &result_rgb);
-            //apply_brightness(&result_rgb, CONFIG_RGBLED_WIDGET_BRIGHTNESS);
-            
             led_colors[led_index] = result_rgb;
         }
         break;
@@ -544,7 +553,7 @@ static void update_all_animations(void) {
 
 // Enhanced status indication with patterns
 static int indicate_battery_enhanced(void) {
-    uint8_t battery_level = zmk_battery_state_of_charge();
+    uint8_t battery_level = get_local_battery_level();
     uint8_t color_idx = 0;
     struct animation_state pattern = {0};
     int ret = 0;
@@ -683,6 +692,7 @@ switch (profile_index) {
     // 分体副键盘的连接状态保持原样，或你可以根据需要修改
     if (zmk_split_bt_peripheral_is_connected()) {
         color_idx = CONFIG_RGBLED_WIDGET_CONN_COLOR_CONNECTED;
+        pattern.start_color = color_idx;
         duration_ms = CONFIG_RGBLED_WIDGET_CONN_CONNECTED_DURATION_MS;
         LOG_INF("Enhanced peripheral connected indication");
     } else {
@@ -752,7 +762,7 @@ static int indicate_layer_enhanced(bool use_shared) {
 
 // Simplified versions without animations
 static int indicate_battery_enhanced(void) {
-    uint8_t battery_level = zmk_battery_state_of_charge();
+    uint8_t battery_level = get_local_battery_level();
     uint8_t color_idx = get_battery_color(battery_level);
     return set_status_led(STATUS_BATTERY, color_idx, 0, true);
 }
@@ -1338,6 +1348,12 @@ static int led_battery_listener_cb(const zmk_event_t *eh) {
     bool is_usb_event = (as_zmk_usb_conn_state_changed(eh) != NULL);
     struct zmk_battery_state_changed *bat_ev = as_zmk_battery_state_changed(eh);
     bool is_charging = zmk_usb_is_powered();
+
+#if IS_ENABLED(CONFIG_RGBLED_WIDGET_WS2812)
+    if (bat_ev != NULL && bat_ev->state_of_charge > 0) {
+        last_valid_battery_level = bat_ev->state_of_charge;
+    }
+#endif
     // ==================== 新增：EMA 低通滤波平滑监听 ====================
     #if IS_ENABLED(CONFIG_ZMK_SPLIT) && !IS_ENABLED(CONFIG_ZMK_SPLIT_ROLE_CENTRAL)
         static float smoothed_battery = -1.0f;       
