@@ -627,6 +627,9 @@ The migration is fully reversible:
 | Name                               | Description                                    | Default |
 | ---------------------------------- | ---------------------------------------------- | ------- |
 | `CONFIG_RGBLED_WIDGET_INTERVAL_MS` | Minimum wait duration between two blinks in ms | 500     |
+| `CONFIG_RGBLED_WIDGET_ANIMATION_TICK_MS` | Animation frame interval in ms; larger values reduce wakeups and SPI writes | 125 |
+| `CONFIG_RGBLED_WIDGET_EXT_POWER_TIMEOUT_MS` | Delay after the strip becomes idle before external power is disabled; `0` disables automatic power-off | 15000 |
+| `CONFIG_RGBLED_WIDGET_EXT_POWER_SETTLE_MS` | Delay after enabling external power before the first WS2812 frame | 10 |
 
 </details>
 
@@ -674,9 +677,9 @@ The non-default ones (second and third below) only work on central parts of spli
 | `CONFIG_RGBLED_WIDGET_CONN_COLOR_BT3`          | Color index for BLE Profile 3                               | Yellow (`3`) |
 | `CONFIG_RGBLED_WIDGET_CONN_COLOR_BT4`           | Color index for BLE Profile 4                               | Magenta (`5`)|
 | `CONFIG_RGBLED_WIDGET_CONN_COLOR_BT_FALLBACK`  | Color index for fallback BLE Profile                        | White (`7`)  |
-| `CONFIG_RGBLED_WIDGET_CONN_ADV_DURATION_MS`     | Duration for BLE advertising animation (ms)                  | 30000        |
-| `CONFIG_RGBLED_WIDGET_CONN_CONNECTED_DURATION_MS` | Duration for BLE connected static display (ms)             | 3000         |
-| `CONFIG_RGBLED_WIDGET_CONN_DISCONNECTED_DURATION_MS` | Duration for BLE disconnected animation (ms)              | 2500         |
+| `CONFIG_RGBLED_WIDGET_CONN_ADV_DURATION_MS`     | Duration for BLE advertising animation (ms)                  | 5000         |
+| `CONFIG_RGBLED_WIDGET_CONN_CONNECTED_DURATION_MS` | Duration for BLE connected static display (ms)             | 1500         |
+| `CONFIG_RGBLED_WIDGET_CONN_DISCONNECTED_DURATION_MS` | Duration for BLE disconnected animation (ms)              | 1500         |
 
 </details>
 
@@ -886,4 +889,8 @@ CONFIG_RGBLED_WIDGET_BRIGHTNESS=128
 - **Current**: ~60mA per LED at full white brightness
 - **Voltage**: 5V recommended (brighter), 3.3V compatible (dimmer)
 - **Brightness Control**: Use `CONFIG_RGBLED_WIDGET_BRIGHTNESS` to reduce power
+- **Power Gating**: Use `CONFIG_RGBLED_WIDGET_EXT_POWER_TIMEOUT_MS` to turn off the
+  WS2812 rail after the final black frame
+- **Animation Cost**: Increase `CONFIG_RGBLED_WIDGET_ANIMATION_TICK_MS` to reduce
+  CPU wakeups and SPI transfers
 - **Strip Length**: 1-4 LEDs recommended for keyboard use

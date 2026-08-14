@@ -51,6 +51,15 @@ config RGBLED_WIDGET_ANIMATIONS
       Enable advanced LED patterns like pulse, breathing, and smooth
       color transitions for enhanced visual feedback.
 
+config RGBLED_WIDGET_ANIMATION_TICK_MS
+    int "Animation update interval in milliseconds"
+    range 50 1000
+    default 125
+    depends on RGBLED_WIDGET_ANIMATIONS
+    help
+      Time between animation frames. Larger values reduce CPU wakeups and SPI
+      transfers at the cost of less fluid animations.
+
 config RGBLED_WIDGET_LED_SHARING
     bool "Enable LED sharing for multi-function display"
     default y
@@ -130,6 +139,14 @@ config RGBLED_WIDGET_EXT_POWER_TIMEOUT_MS
       Time in milliseconds the widget waits after all animations and static LEDs
       are cleared before physically turning off the WS2812 power via ext_power.
       Set to 15000 (15s) by default. Set to 0 to disable automatic power off.
+
+config RGBLED_WIDGET_EXT_POWER_SETTLE_MS
+    int "WS2812 power rail settle time in milliseconds"
+    range 0 100
+    default 10
+    depends on RGBLED_WIDGET_WS2812
+    help
+      Delay after enabling external power before sending the first WS2812 frame.
 
 # Battery level settings
 
@@ -231,7 +248,7 @@ config RGBLED_WIDGET_CONN_COLOR_USB
     default $(COLOR_CYAN)
 
 menu "RGB LED Widget Connectivity Options"
-    depends on CONFIG_RGBLED_WIDGET_WS2812
+    depends on RGBLED_WIDGET_WS2812
 
 config RGBLED_WIDGET_CONN_COLOR_BT0
     int "Color index for BLE Profile 0"
@@ -261,15 +278,18 @@ config RGBLED_WIDGET_CONN_COLOR_BT_FALLBACK
 
 config RGBLED_WIDGET_CONN_ADV_DURATION_MS
     int "Duration for BLE advertising animation (ms)"
-    default 30000
+    range 0 60000
+    default 5000
 
 config RGBLED_WIDGET_CONN_CONNECTED_DURATION_MS
     int "Duration for BLE connected static display (ms)"
-    default 3000
+    range 0 60000
+    default 1500
 
 config RGBLED_WIDGET_CONN_DISCONNECTED_DURATION_MS
     int "Duration for BLE disconnected animation (ms)"
-    default 2500
+    range 0 60000
+    default 1500
 
 endmenu
 
