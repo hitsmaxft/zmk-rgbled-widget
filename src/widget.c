@@ -180,6 +180,9 @@ struct blink_item {
 // flag to indicate whether the initial boot up sequence is complete
 static bool initialized = false;
 
+// Track current activity state to suppress LED updates during idle/sleep
+static enum zmk_activity_state current_activity_state = ZMK_ACTIVITY_ACTIVE;
+
 #if IS_ENABLED(CONFIG_ZMK_BATTERY_REPORTING) && IS_ENABLED(CONFIG_RGBLED_WIDGET_WS2812)
 // A zero reading means "not available" in the widget protocol. Preserve the last
 // valid local sample so an early/stale reading does not masquerade as a missing battery.
@@ -1241,7 +1244,7 @@ static void indicate_connectivity_internal(void) {
 }
 
 static int led_output_listener_cb(const zmk_event_t *eh) {
-    if (initialized) {
+    if (initialized && current_activity_state == ZMK_ACTIVITY_ACTIVE) {
         indicate_connectivity();
     }
     return 0;
@@ -1345,6 +1348,9 @@ static int led_battery_listener_cb(const zmk_event_t *eh) {
     if (!initialized) {
         return 0;
     }
+    if (current_activity_state != ZMK_ACTIVITY_ACTIVE) {
+        return 0;
+    }
     bool is_usb_event = (as_zmk_usb_conn_state_changed(eh) != NULL);
     struct zmk_battery_state_changed *bat_ev = as_zmk_battery_state_changed(eh);
     bool is_charging = zmk_usb_is_powered();
@@ -1419,7 +1425,7 @@ ZMK_SUBSCRIPTION(led_battery_listener, zmk_usb_conn_state_changed);
 #if !IS_ENABLED(CONFIG_ZMK_SPLIT) || IS_ENABLED(CONFIG_ZMK_SPLIT_ROLE_CENTRAL)
 // ==================== Caps Lock Listener ====================
 static int led_capslock_listener_cb(const zmk_event_t *eh) {
-    if (!initialized) {
+    if (!initialized || current_activity_state != ZMK_ACTIVITY_ACTIVE) {
         return 0;
     }
 
@@ -1489,7 +1495,7 @@ void update_layer_color(void) {
 
     if (led_layer_color != layer_color_idx[index]) {
         led_layer_color = layer_color_idx[index];
-        
+
 #if IS_ENABLED(CONFIG_RGBLED_WIDGET_WS2812)
         // Use enhanced layer color with persistent display
         set_status_led(STATUS_LAYER, led_layer_color, 0, true);
@@ -1504,33 +1510,70 @@ void update_layer_color(void) {
 }
 
 static int led_layer_color_listener_cb(const zmk_event_t *eh) {
-    struct zmk_activity_state_changed *ev = as_zmk_activity_state_changed(eh);
-
-    // check if this is indeed an activity state changed event
-    if (ev != NULL) {
-        switch (ev->state) {
-        case ZMK_ACTIVITY_SLEEP:
-            LOG_INF("Detected sleep activity state, turn off LED");
-            set_rgb_leds(0, 0);
-            break;
-        default: // not handling IDLE and ACTIVE yet
-            break;
-        }
-        return 0;
-    }
-
-    // it must be a layer change event instead
-    if (initialized) {
+    if (initialized && current_activity_state == ZMK_ACTIVITY_ACTIVE) {
         update_layer_color();
     }
     return 0;
 }
 
-// run layer_color_listener_cb on layer status change event and activity state event
 ZMK_LISTENER(led_layer_color_listener, led_layer_color_listener_cb);
 ZMK_SUBSCRIPTION(led_layer_color_listener, zmk_layer_state_changed);
-ZMK_SUBSCRIPTION(led_layer_color_listener, zmk_activity_state_changed);
 #endif // SHOW_LAYER_COLORS
+
+// Activity state listener — always active regardless of SHOW_LAYER_COLORS
+static int led_activity_listener_cb(const zmk_event_t *eh) {
+    struct zmk_activity_state_changed *ev = as_zmk_activity_state_changed(eh);
+    if (ev == NULL) {
+        return 0;
+    }
+
+    current_activity_state = ev->state;
+
+    switch (ev->state) {
+    case ZMK_ACTIVITY_ACTIVE:
+        LOG_INF("Activity ACTIVE, restoring LED state");
+#if IS_ENABLED(CONFIG_RGBLED_WIDGET_WS2812)
+        // Restore layer color and refresh status indicators
+#if SHOW_LAYER_COLORS
+        update_layer_color();
+#endif
+        indicate_connectivity();
+#if IS_ENABLED(CONFIG_ZMK_BATTERY_REPORTING)
+        indicate_battery();
+#endif
+#else
+        set_rgb_leds(led_layer_color, 0);
+#endif
+        break;
+    case ZMK_ACTIVITY_IDLE:
+    case ZMK_ACTIVITY_SLEEP:
+        LOG_INF("Activity %s, turning off LEDs and ext_power",
+                ev->state == ZMK_ACTIVITY_IDLE ? "IDLE" : "SLEEP");
+#if IS_ENABLED(CONFIG_RGBLED_WIDGET_WS2812)
+        k_mutex_lock(&ws2812_mutex, K_FOREVER);
+        for (int i = 0; i < CONFIG_RGBLED_WIDGET_LED_COUNT; i++) {
+            led_colors[i] = (struct led_rgb){0, 0, 0};
+            led_states[i].anim.type = ANIM_STATIC;
+        }
+        ws2812_update_strip_locked();
+        if (ext_power_dev && ext_power_is_on) {
+            k_work_cancel_delayable(&ext_power_off_work);
+            ext_power_disable(ext_power_dev);
+            ext_power_is_on = false;
+            strip_cache_valid = false;
+            LOG_INF("ext_power OFF (activity state change)");
+        }
+        k_mutex_unlock(&ws2812_mutex);
+#else
+        set_rgb_leds(0, 0);
+#endif
+        break;
+    }
+    return 0;
+}
+
+ZMK_LISTENER(led_activity_listener, led_activity_listener_cb);
+ZMK_SUBSCRIPTION(led_activity_listener, zmk_activity_state_changed);
 
 #if !IS_ENABLED(CONFIG_ZMK_SPLIT) || IS_ENABLED(CONFIG_ZMK_SPLIT_ROLE_CENTRAL)
 void indicate_layer(void) {
@@ -1564,8 +1607,9 @@ void indicate_layer(void) {
 static struct k_work_delayable layer_indicate_work;
 
 static int led_layer_listener_cb(const zmk_event_t *eh) {
-    // ignore if not initialized yet or layer off events
-    if (initialized && as_zmk_layer_state_changed(eh)->state) {
+    // ignore if not initialized yet, layer off events, or inactive state
+    if (initialized && current_activity_state == ZMK_ACTIVITY_ACTIVE &&
+        as_zmk_layer_state_changed(eh)->state) {
         k_work_reschedule(&layer_indicate_work, K_MSEC(CONFIG_RGBLED_WIDGET_LAYER_DEBOUNCE_MS));
     }
     return 0;
