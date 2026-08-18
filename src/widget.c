@@ -4,6 +4,7 @@
 #include <zephyr/init.h>
 #include <zephyr/kernel.h>
 #include <errno.h>
+#include <limits.h>
 #include <string.h>
 
 #include <zmk/battery.h>
@@ -16,6 +17,7 @@
 #include <zmk/events/usb_conn_state_changed.h>
 #include <zmk/events/endpoint_changed.h>
 #include <zmk/events/layer_state_changed.h>
+#include <zmk/events/position_state_changed.h>
 #include <zmk/events/split_peripheral_status_changed.h>
 #include <zmk/events/activity_state_changed.h>
 #include <zmk/events/hid_indicators_changed.h>
@@ -67,6 +69,8 @@ static int set_led_pattern(uint8_t led_index, struct animation_state *pattern);
 static void rgb_interpolate(struct led_rgb *start, struct led_rgb *end,
                             uint8_t factor, struct led_rgb *result);
 static void update_led_animation(uint8_t led_index);
+static void check_shared_led_timeouts(void);
+static void schedule_led_update(void);
 
 // Enhanced priority system
 enum status_priority {
@@ -105,6 +109,7 @@ struct led_state {
     bool is_shared;               // Whether LED is currently shared
     bool is_persistent;           // Whether status should persist
     uint32_t share_end_time;      // When to return to base status
+    uint32_t share_timeout_ms;    // Duration to use when activity renews a shared status
     uint32_t animation_start_time; // Uptime when the current animation was triggered
     struct animation_state anim;  // Current animation state
 };
@@ -416,10 +421,12 @@ int ws2812_clear_status_led(enum status_type status_type) {
                 led_states[i].priority = PRIORITY_AMBIENT;
                 led_states[i].is_persistent = false;
                 led_states[i].share_end_time = 0;
+                led_states[i].share_timeout_ms = 0;
                 led_states[i].anim.type = ANIM_STATIC;
             }
         }
     }
+    schedule_led_update();
     return 0;
 }
 
@@ -467,6 +474,7 @@ static int set_led_pattern(uint8_t led_index, struct animation_state *pattern) {
 
     int ret = ws2812_update_strip_locked();
     k_mutex_unlock(&ws2812_mutex);
+    schedule_led_update();
     return ret;
 }
 
@@ -788,6 +796,8 @@ static int indicate_layer_enhanced(bool use_shared) {
 
 static const struct device *ext_power_dev = NULL;
 static struct k_work_delayable ext_power_off_work;
+static struct k_work_delayable led_timeout_work;
+static bool led_timeout_work_ready;
 static bool ext_power_is_on = true;
 
 static bool ws2812_strip_is_black_locked(void) {
@@ -873,6 +883,7 @@ static void ws2812_strip_init(void) {
         led_states[i].is_shared = false;
         led_states[i].is_persistent = false;
         led_states[i].share_end_time = 0;
+        led_states[i].share_timeout_ms = 0;
     }
     
     int ret = ws2812_update_strip_locked();
@@ -949,9 +960,11 @@ int ws2812_clear_led(uint8_t led_index) {
     led_states[led_index].is_shared = false;
     led_states[led_index].is_persistent = false;
     led_states[led_index].share_end_time = 0;
+    led_states[led_index].share_timeout_ms = 0;
     led_states[led_index].anim.type = ANIM_STATIC;
     int ret = ws2812_update_strip_locked();
     k_mutex_unlock(&ws2812_mutex);
+    schedule_led_update();
     return ret;
 }
 
@@ -1009,8 +1022,10 @@ int ws2812_clear_all(void) {
         led_states[i].is_shared = false;
         led_states[i].is_persistent = false;
         led_states[i].share_end_time = 0;
+        led_states[i].share_timeout_ms = 0;
         led_states[i].anim.type = ANIM_STATIC;
     }
+    schedule_led_update();
     return 0;
 }
 
@@ -1070,10 +1085,15 @@ static int set_led_with_sharing(uint8_t led_index, uint8_t color_idx, uint8_t pr
     
     if (share_timeout_ms > 0) {
         state->share_end_time = k_uptime_get_32() + share_timeout_ms;
+        state->share_timeout_ms = share_timeout_ms;
+    } else {
+        state->share_end_time = 0;
+        state->share_timeout_ms = 0;
     }
     
     // Set the LED color
     ws2812_set_led(led_index, color_idx);
+    schedule_led_update();
     
     LOG_DBG("Set LED %d to color %d (priority %d, is_shared %s)", 
             led_index, color_idx, priority, state->is_shared ? "yes" : "no");
@@ -1094,12 +1114,14 @@ static void return_shared_led(uint8_t led_index) {
         state->is_shared = false;
         state->priority = PRIORITY_AMBIENT;
         state->share_end_time = 0;
+        state->share_timeout_ms = 0;
         
         // 【纯净修复核心 1】：超时归还控制权时，强行终止任何呼吸/闪烁动画，恢复静态底色
         state->anim.type = ANIM_STATIC; 
         
         LOG_DBG("Returned shared LED %d to base color %d", led_index, state->base_color);
     }
+    schedule_led_update();
 }
 
 // Check for expired shared LEDs
@@ -1115,6 +1137,71 @@ static void check_shared_led_timeouts(void) {
             return_shared_led(i);
         }
     }
+}
+
+/* The sole WS2812 scheduler: animation frames and temporary-status expiry. */
+static void schedule_led_update(void) {
+    if (!led_timeout_work_ready) {
+        return;
+    }
+
+    uint32_t now = k_uptime_get_32();
+    int32_t nearest_delay_ms = INT_MAX;
+
+    for (int i = 0; i < CONFIG_RGBLED_WIDGET_LED_COUNT; i++) {
+        const struct led_state *state = &led_states[i];
+        if (state->anim.type != ANIM_STATIC &&
+            CONFIG_RGBLED_WIDGET_ANIMATION_TICK_MS < nearest_delay_ms) {
+            nearest_delay_ms = CONFIG_RGBLED_WIDGET_ANIMATION_TICK_MS;
+        }
+
+        if (state->is_shared && state->share_end_time > 0) {
+            int32_t delay_ms = (int32_t)(state->share_end_time - now);
+            if (delay_ms < nearest_delay_ms) {
+                nearest_delay_ms = delay_ms;
+            }
+        }
+    }
+
+    if (nearest_delay_ms == INT_MAX) {
+        k_work_cancel_delayable(&led_timeout_work);
+    } else {
+        k_work_reschedule(&led_timeout_work,
+                          nearest_delay_ms <= 0 ? K_NO_WAIT : K_MSEC(nearest_delay_ms));
+        return;
+    }
+
+    if (ext_power_dev && CONFIG_RGBLED_WIDGET_EXT_POWER_TIMEOUT_MS > 0) {
+        k_mutex_lock(&ws2812_mutex, K_FOREVER);
+        bool can_power_off = ext_power_is_on && ws2812_strip_can_power_off_locked();
+        k_mutex_unlock(&ws2812_mutex);
+        if (can_power_off) {
+            k_work_reschedule(&ext_power_off_work,
+                              K_MSEC(CONFIG_RGBLED_WIDGET_EXT_POWER_TIMEOUT_MS));
+        }
+    }
+}
+
+static void led_timeout_handler(struct k_work *work) {
+    ARG_UNUSED(work);
+
+    check_shared_led_timeouts();
+#if IS_ENABLED(CONFIG_RGBLED_WIDGET_ANIMATIONS)
+    update_all_animations();
+#endif
+    schedule_led_update();
+}
+
+static void renew_shared_led_timeouts(void) {
+    uint32_t now = k_uptime_get_32();
+
+    for (int i = 0; i < CONFIG_RGBLED_WIDGET_LED_COUNT; i++) {
+        struct led_state *state = &led_states[i];
+        if (state->is_shared && state->share_timeout_ms > 0) {
+            state->share_end_time = now + state->share_timeout_ms;
+        }
+    }
+    schedule_led_update();
 }
 
 // Enhanced set_rgb_leds function with multi-LED support
@@ -1192,8 +1279,7 @@ static void set_rgb_leds(uint8_t color, uint16_t duration_ms) {
 }
 #endif
 
-// define message queue of blink work items, that will be processed by a
-// separate thread
+// Define message queue of blink work items, processed by the compatibility thread.
 K_MSGQ_DEFINE(led_msgq, sizeof(struct blink_item), 16, 1);
 
 static void indicate_connectivity_internal(void) {
@@ -1550,9 +1636,20 @@ static int led_activity_listener_cb(const zmk_event_t *eh) {
         LOG_INF("Activity %s, turning off LEDs and ext_power",
                 ev->state == ZMK_ACTIVITY_IDLE ? "IDLE" : "SLEEP");
 #if IS_ENABLED(CONFIG_RGBLED_WIDGET_WS2812)
+        if (led_timeout_work_ready) {
+            k_work_cancel_delayable(&led_timeout_work);
+        }
         k_mutex_lock(&ws2812_mutex, K_FOREVER);
         for (int i = 0; i < CONFIG_RGBLED_WIDGET_LED_COUNT; i++) {
             led_colors[i] = (struct led_rgb){0, 0, 0};
+            led_states[i].current_color = 0;
+            led_states[i].base_color = 0;
+            led_states[i].status_type = STATUS_CUSTOM;
+            led_states[i].priority = PRIORITY_AMBIENT;
+            led_states[i].is_shared = false;
+            led_states[i].is_persistent = false;
+            led_states[i].share_end_time = 0;
+            led_states[i].share_timeout_ms = 0;
             led_states[i].anim.type = ANIM_STATIC;
         }
         ws2812_update_strip_locked();
@@ -1574,6 +1671,20 @@ static int led_activity_listener_cb(const zmk_event_t *eh) {
 
 ZMK_LISTENER(led_activity_listener, led_activity_listener_cb);
 ZMK_SUBSCRIPTION(led_activity_listener, zmk_activity_state_changed);
+
+#if IS_ENABLED(CONFIG_RGBLED_WIDGET_WS2812)
+static int led_position_listener_cb(const zmk_event_t *eh) {
+    const struct zmk_position_state_changed *ev = as_zmk_position_state_changed(eh);
+    if (initialized && ev != NULL && ev->state &&
+        current_activity_state == ZMK_ACTIVITY_ACTIVE) {
+        renew_shared_led_timeouts();
+    }
+    return 0;
+}
+
+ZMK_LISTENER(led_position_listener, led_position_listener_cb);
+ZMK_SUBSCRIPTION(led_position_listener, zmk_position_state_changed);
+#endif
 
 #if !IS_ENABLED(CONFIG_ZMK_SPLIT) || IS_ENABLED(CONFIG_ZMK_SPLIT_ROLE_CENTRAL)
 void indicate_layer(void) {
@@ -1633,6 +1744,10 @@ extern void led_process_thread(void *d0, void *d1, void *d2) {
 #endif
 
     // 初始化硬件电源开关，并确保开机时通电
+#if IS_ENABLED(CONFIG_RGBLED_WIDGET_WS2812)
+    k_work_init_delayable(&led_timeout_work, led_timeout_handler);
+    led_timeout_work_ready = true;
+#endif
     ext_power_dev = device_get_binding("EXT_POWER");
     if (ext_power_dev) {
         k_work_init_delayable(&ext_power_off_work, ext_power_off_handler);
@@ -1675,16 +1790,14 @@ extern void led_process_thread(void *d0, void *d1, void *d2) {
         }
         // =======================================================
 
-        k_timeout_t tick_rate =
-            is_active ? K_MSEC(CONFIG_RGBLED_WIDGET_ANIMATION_TICK_MS) : K_MSEC(1000);
-        int result_code = k_msgq_get(&led_msgq, &blink, tick_rate);
-
+        k_timeout_t tick_rate;
 #if IS_ENABLED(CONFIG_RGBLED_WIDGET_WS2812)
-        check_shared_led_timeouts();
-#   if IS_ENABLED(CONFIG_RGBLED_WIDGET_ANIMATIONS)
-        update_all_animations();
-#   endif
+        // WS2812 deadlines are scheduled by led_timeout_work, never polled here.
+        tick_rate = K_FOREVER;
+#else
+        tick_rate = is_active ? K_MSEC(CONFIG_RGBLED_WIDGET_ANIMATION_TICK_MS) : K_MSEC(1000);
 #endif
+        int result_code = k_msgq_get(&led_msgq, &blink, tick_rate);
 
         if (result_code == 0) {
             LOG_DBG("LED message: color=%d, duration=%d, sleep=%d", blink.color,
